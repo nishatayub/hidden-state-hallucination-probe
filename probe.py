@@ -1,7 +1,7 @@
 """
 probe.py — Hallucination probe classifier (student-implemented).
 
-Implements ``HallucinationProbe``, a binary MLP that classifies feature
+Implements ``HallucinationProbe``, a lightweight linear probe that classifies feature
 vectors as truthful (0) or hallucinated (1).  Called from ``solution.py``
 via ``evaluate.run_evaluation``.  All four public methods (``fit``,
 ``fit_hyperparameters``, ``predict``, ``predict_proba``) must be implemented
@@ -14,21 +14,23 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.metrics import f1_score
+from sklearn.model_selection import train_test_split
+from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
 
 class HallucinationProbe(nn.Module):
     """Binary classifier that detects hallucinations from hidden-state features.
 
-    Extends ``torch.nn.Module``; the default architecture is a single
-    hidden-layer MLP with ``StandardScaler`` pre-processing.  The network is
-    built lazily in ``fit()`` once the feature dimension is known.
+    Extends ``torch.nn.Module``; the default architecture is a regularised
+    linear probe with ``StandardScaler`` and optional PCA pre-processing.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self._net: nn.Sequential | None = None  # built lazily in fit()
         self._scaler = StandardScaler()
+        self._pca: PCA | None = None
         self._threshold: float = 0.5  # tuned by fit_hyperparameters()
 
     # ------------------------------------------------------------------
@@ -42,11 +44,7 @@ class HallucinationProbe(nn.Module):
         Args:
             input_dim: Feature vector dimensionality.
         """
-        self._net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-        )
+        self._net = nn.Sequential(nn.Linear(input_dim, 1))
 
     # ------------------------------------------------------------------
 
@@ -80,30 +78,69 @@ class HallucinationProbe(nn.Module):
             ``self`` (for method chaining).
         """
         X_scaled = self._scaler.fit_transform(X)
+        n_components = min(96, X_scaled.shape[1], max(8, len(X_scaled) // 4))
+        if n_components < X_scaled.shape[1]:
+            self._pca = PCA(n_components=n_components, svd_solver="full")
+            X_scaled = self._pca.fit_transform(X_scaled)
+        else:
+            self._pca = None
+
+        idx = np.arange(len(y))
+        if len(y) >= 40 and len(np.unique(y)) > 1:
+            idx_fit, idx_stop = train_test_split(
+                idx,
+                test_size=0.2,
+                random_state=13,
+                stratify=y,
+            )
+        else:
+            idx_fit, idx_stop = idx, idx
 
         self._build_network(X_scaled.shape[1])
 
-        X_t = torch.from_numpy(X_scaled).float()
-        y_t = torch.from_numpy(y.astype(np.float32))
+        X_fit = torch.from_numpy(X_scaled[idx_fit]).float()
+        y_fit = torch.from_numpy(y[idx_fit].astype(np.float32))
+        X_stop = torch.from_numpy(X_scaled[idx_stop]).float()
+        y_stop = torch.from_numpy(y[idx_stop].astype(np.float32))
 
         # Weight positive examples by neg/pos ratio to handle class imbalance.
-        n_pos = int(y.sum())
-        n_neg = len(y) - n_pos
+        n_pos = int(y[idx_fit].sum())
+        n_neg = len(idx_fit) - n_pos
         pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
         # ------------------------------------------------------------------
         # STUDENT: Replace or extend the training loop below.
         # ------------------------------------------------------------------
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=3e-3, weight_decay=5e-3)
+        best_state = None
+        best_val_loss = float("inf")
+        patience = 25
+        epochs_without_improvement = 0
 
-        self.train()
         for _ in range(200):
+            self.train()
             optimizer.zero_grad()
-            logits = self(X_t)
-            loss = criterion(logits, y_t)
+            logits = self(X_fit)
+            loss = criterion(logits, y_fit)
             loss.backward()
             optimizer.step()
+
+            self.eval()
+            with torch.no_grad():
+                val_loss = criterion(self(X_stop), y_stop).item()
+
+            if val_loss < best_val_loss - 1e-4:
+                best_val_loss = val_loss
+                best_state = {k: v.detach().clone() for k, v in self.state_dict().items()}
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= patience:
+                    break
+
+        if best_state is not None:
+            self.load_state_dict(best_state)
         # ------------------------------------------------------------------
 
         self.eval()
@@ -130,7 +167,7 @@ class HallucinationProbe(nn.Module):
         probs = self.predict_proba(X_val)[:, 1]
 
         # Candidate thresholds: unique predicted probabilities plus a coarse grid.
-        candidates = np.unique(np.concatenate([probs, np.linspace(0.0, 1.0, 101)]))
+        candidates = np.unique(np.concatenate([probs, np.linspace(0.05, 0.95, 91)]))
 
         best_threshold = 0.5
         best_f1 = -1.0
@@ -170,9 +207,10 @@ class HallucinationProbe(nn.Module):
             Used to compute AUROC.
         """
         X_scaled = self._scaler.transform(X)
+        if self._pca is not None:
+            X_scaled = self._pca.transform(X_scaled)
         X_t = torch.from_numpy(X_scaled).float()
         with torch.no_grad():
             logits = self(X_t)
             prob_pos = torch.sigmoid(logits).numpy()
         return np.stack([1.0 - prob_pos, prob_pos], axis=1)
-

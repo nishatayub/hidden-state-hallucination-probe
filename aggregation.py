@@ -18,6 +18,30 @@ single entry point called from the notebook.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
+
+
+def _real_token_slice(attention_mask: torch.Tensor) -> tuple[int, int]:
+    real_positions = attention_mask.nonzero(as_tuple=False).squeeze(-1)
+    start = int(real_positions[0].item())
+    end = int(real_positions[-1].item()) + 1
+    return start, end
+
+
+def _response_window(attention_mask: torch.Tensor) -> slice:
+    start, end = _real_token_slice(attention_mask)
+    seq_len = end - start
+    tail_len = max(16, seq_len // 3)
+    response_start = max(start, end - tail_len)
+    return slice(response_start, end)
+
+
+def _selected_layers(hidden_states: torch.Tensor) -> torch.Tensor:
+    # Skip the embedding layer and use the top transformer layers where answer
+    # semantics and uncertainty signals tend to be most separable.
+    n_transformer_layers = hidden_states.size(0) - 1
+    n_take = min(4, n_transformer_layers)
+    return hidden_states[-n_take:]
 
 
 def aggregate(
@@ -45,16 +69,15 @@ def aggregate(
     # STUDENT: Replace or extend the aggregation below.
     # ------------------------------------------------------------------
 
-    # Default: last real token of the final transformer layer.
-    layer = hidden_states[-1]          # (seq_len, hidden_dim)
+    layers = _selected_layers(hidden_states)
+    response_tokens = layers[:, _response_window(attention_mask), :]
 
-    # Find the index of the last real (non-padding) token.
-    real_positions = attention_mask.nonzero(as_tuple=False)  # (n_real, 1)
-    last_pos = int(real_positions[-1].item())                 # scalar index
+    mean_pool = response_tokens.mean(dim=1)
+    max_pool = response_tokens.max(dim=1).values
+    last_token = response_tokens[:, -1, :]
 
-    feature = layer[last_pos]          # (hidden_dim,)
-
-    return feature
+    pooled = torch.cat([mean_pool[-2:], max_pool[-1:], last_token[-1:]], dim=0)
+    return pooled.reshape(-1)
     # ------------------------------------------------------------------
 
 
@@ -85,8 +108,35 @@ def extract_geometric_features(
     # STUDENT: Replace or extend the geometric feature extraction below.
     # ------------------------------------------------------------------
 
-    # Placeholder: returns an empty tensor (no geometric features).
-    return torch.zeros(0)
+    layers = _selected_layers(hidden_states)
+    response_tokens = layers[:, _response_window(attention_mask), :]
+
+    token_norms = torch.linalg.vector_norm(response_tokens, dim=-1)
+    mean_norm_per_layer = token_norms.mean(dim=1)
+    std_norm_per_layer = token_norms.std(dim=1, unbiased=False)
+
+    layer_means = response_tokens.mean(dim=1)
+    inter_layer_cos = []
+    for i in range(layer_means.size(0) - 1):
+        inter_layer_cos.append(
+            F.cosine_similarity(layer_means[i], layer_means[i + 1], dim=0)
+        )
+
+    trajectory = F.cosine_similarity(
+        response_tokens[-1, 0],
+        response_tokens[-1, -1],
+        dim=0,
+    ).unsqueeze(0)
+    response_len = torch.tensor([float(response_tokens.size(1))], dtype=hidden_states.dtype)
+
+    features = [
+        mean_norm_per_layer,
+        std_norm_per_layer,
+        torch.stack(inter_layer_cos) if inter_layer_cos else torch.zeros(0),
+        trajectory,
+        response_len,
+    ]
+    return torch.cat(features, dim=0)
 
 
 def aggregation_and_feature_extraction(

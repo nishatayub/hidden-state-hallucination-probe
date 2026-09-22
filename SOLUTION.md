@@ -5,8 +5,15 @@
 ### Environment
 
 - Python 3.11
-- macOS with Apple Silicon (`mps`) was used for development
+- macOS with Apple Silicon, run on **CPU** — the MPS (Metal) backend was
+  tried first but caused a native segfault inside Apple's GPU driver during
+  feature extraction, and later a near-total stall on a longer run even
+  after that crash was fixed. See `EXPERIMENTS.md`, issue 1, for the
+  root cause and fix. `solution.py` still auto-detects CUDA if available;
+  CPU is the fallback verified stable end-to-end on this machine.
 - Dependencies are listed in `requirements.txt`
+- Full-dataset extraction + evaluation takes roughly 90 minutes on CPU on
+  this machine (`extract_time_s` in `results.json`).
 
 ### Commands
 
@@ -31,6 +38,24 @@ Running `python solution.py` produces:
 - `solution.py` is used exactly as provided for end-to-end execution, with the geometric feature flag enabled.
 - Hidden states are extracted from `prompt + response` using `Qwen/Qwen2.5-0.5B`.
 - The evaluation now uses grouped cross-validation based on repeated context passages extracted from the prompt text.
+
+## Results
+
+Full 689-row dataset, 5-fold grouped cross-validation, averaged:
+
+| | Accuracy | F1 | AUROC |
+|---|---|---|---|
+| Majority-class baseline | 70.13% | 82.43% | N/A |
+| Probe (test split) | 69.94% | 81.59% | **64.81%** |
+
+The probe does not consistently beat the majority-class baseline on raw
+accuracy across folds (wins in 1 of 5, ties in 1, trails narrowly in 3;
+the average 0.19-point gap is within noise for ~140 test rows per fold).
+It does show consistent, above-chance discriminative ability: test AUROC
+falls between 0.60 and 0.71 in every one of the 5 folds. Full per-fold
+numbers are in `results.json`; the debugging and ablation work behind these
+numbers — including three ideas that were tested and did not help — is in
+`EXPERIMENTS.md`.
 
 ## Final Solution Description
 
@@ -91,9 +116,12 @@ The final probe uses:
 1. `StandardScaler`
 2. optional `PCA` compression
 3. a regularized linear layer trained with `BCEWithLogitsLoss`
-4. class imbalance handling through `pos_weight`
+4. class imbalance handling through a softened `pos_weight` (square root of
+   the inverse-frequency ratio, rather than the full ratio — see
+   `EXPERIMENTS.md` for why the full ratio fights the accuracy objective)
 5. internal early stopping on a held-out training subset
-6. validation-based threshold tuning for prediction
+6. validation-based threshold tuning, optimized directly for **accuracy**
+   (the competition's primary metric) rather than F1
 
 This is more defensible for a small dataset than a deeper MLP and is less likely to overfit under grouped evaluation.
 
@@ -134,6 +162,38 @@ I added geometric/statistical features, but I did not rely on them alone as the 
 ### 4. Threshold tuning edge cases
 
 Threshold tuning on an imbalanced dataset can collapse toward degenerate low thresholds. I restricted the threshold search range to avoid obviously pathological settings.
+
+### 5. F1-optimized threshold instead of accuracy-optimized
+
+The threshold tuner originally maximized F1 on the validation split. Since
+the competition's primary ranking metric is accuracy, and this dataset is
+imbalanced (~70% hallucinated), an F1-optimal threshold is not the same
+point as an accuracy-optimal one. Switched the tuning objective to
+`accuracy_score` directly. (Full detail, including a reproducibility bug
+this surfaced, in `EXPERIMENTS.md`, issue 3.)
+
+### 6. Minimal last-layer, last-token aggregation
+
+Tested whether the multi-layer mean/max/last-token pooling was adding real
+signal or just noise/dimensionality, by comparing against the simplest
+possible aggregation (final layer, last token only) on a fast subsample.
+The minimal version scored AUROC 0.45 — below random chance — while the
+multi-layer version scored 0.60-0.65 on the same data. This confirmed the
+multi-layer aggregation is load-bearing and was kept.
+
+### 7. Full inverse-frequency class weighting
+
+The standard `pos_weight = n_neg / n_pos` fully balances the training
+loss 50/50 between classes. That's the right target for balanced accuracy,
+but under this dataset's imbalance it works against the raw-accuracy
+objective, which naturally rewards leaning toward the majority class when
+signal is weak. Tried softening the correction to `sqrt(n_neg / n_pos)`;
+this did not produce a measurable change on the same subsample test
+(66.77% vs. 67.43% test accuracy, within run-to-run noise), so the gap to
+baseline is better explained by the strength of the underlying signal than
+by the loss-weighting scheme. Kept the softened version anyway as the more
+principled choice given it doesn't fight the eval metric even if the
+subsample test couldn't detect a difference.
 
 ## Final Notes
 

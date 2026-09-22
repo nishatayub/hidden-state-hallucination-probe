@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import f1_score
+from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
@@ -77,6 +77,8 @@ class HallucinationProbe(nn.Module):
         Returns:
             ``self`` (for method chaining).
         """
+        torch.manual_seed(13)
+
         X_scaled = self._scaler.fit_transform(X)
         n_components = min(96, X_scaled.shape[1], max(8, len(X_scaled) // 4))
         if n_components < X_scaled.shape[1]:
@@ -103,10 +105,17 @@ class HallucinationProbe(nn.Module):
         X_stop = torch.from_numpy(X_scaled[idx_stop]).float()
         y_stop = torch.from_numpy(y[idx_stop].astype(np.float32))
 
-        # Weight positive examples by neg/pos ratio to handle class imbalance.
+        # The full inverse-frequency ratio (n_neg / n_pos) balances each
+        # class's contribution to the loss 50/50. That's the right target
+        # for balanced accuracy, but the competition metric is raw accuracy
+        # on a test set with the same ~70/30 imbalance as training — fully
+        # equalizing the loss removes the natural lean toward the majority
+        # class that raw accuracy rewards when the signal is weak. Softening
+        # the correction (sqrt of the ratio) keeps some imbalance-awareness
+        # without fighting the accuracy objective as hard.
         n_pos = int(y[idx_fit].sum())
         n_neg = len(idx_fit) - n_pos
-        pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
+        pos_weight = torch.tensor([(n_neg / max(n_pos, 1)) ** 0.5], dtype=torch.float32)
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
         # ------------------------------------------------------------------
@@ -149,7 +158,13 @@ class HallucinationProbe(nn.Module):
     def fit_hyperparameters(
         self, X_val: np.ndarray, y_val: np.ndarray
     ) -> "HallucinationProbe":
-        """Tune the decision threshold on a validation set to maximise F1.
+        """Tune the decision threshold on a validation set to maximise accuracy.
+
+        Accuracy (not F1) is the competition's primary ranking metric, and
+        under this dataset's class imbalance an F1-optimal threshold tends to
+        over-predict the majority class just enough to under-perform a plain
+        majority-vote baseline on accuracy. Optimizing the threshold directly
+        for accuracy keeps the two aligned.
 
         The chosen threshold is stored in ``self._threshold`` and used by
         subsequent ``predict`` calls.  Call this after ``fit`` and before
@@ -170,12 +185,12 @@ class HallucinationProbe(nn.Module):
         candidates = np.unique(np.concatenate([probs, np.linspace(0.05, 0.95, 91)]))
 
         best_threshold = 0.5
-        best_f1 = -1.0
+        best_accuracy = -1.0
         for t in candidates:
             y_pred_t = (probs >= t).astype(int)
-            score = f1_score(y_val, y_pred_t, zero_division=0)
-            if score > best_f1:
-                best_f1 = score
+            score = accuracy_score(y_val, y_pred_t)
+            if score > best_accuracy:
+                best_accuracy = score
                 best_threshold = float(t)
 
         self._threshold = best_threshold

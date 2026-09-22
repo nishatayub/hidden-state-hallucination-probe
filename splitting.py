@@ -35,10 +35,25 @@ _CONTEXT_PATTERN = re.compile(
 
 
 def _extract_context_group(prompt: str) -> str:
+    # 1. Try primary specific pattern (context between instruction and constraints)
     match = _CONTEXT_PATTERN.search(prompt)
-    if match is None:
-        return prompt
-    return match.group(1).strip()
+    if match:
+        return match.group(1).strip()
+    
+    # 2. Fallback: Take the core content between the user tag and the final question
+    # This works for most ChatML formatted prompts even if the wording changes.
+    try:
+        if "<|im_start|>user" in prompt:
+            core = prompt.split("<|im_start|>user")[-1]
+            if "Here is the question:" in core:
+                return core.split("Here is the question:")[0].strip()
+            if "Note that your answer" in core:
+                return core.split("Note that your answer")[0].strip()
+            return core[:200] # Take a prefix of the user message as group
+    except Exception:
+        pass
+
+    return prompt
 
 
 def _group_labels(idx: np.ndarray, groups: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

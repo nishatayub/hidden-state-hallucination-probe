@@ -66,9 +66,11 @@ assert PREDICTIONS_FILE == "predictions.csv"
 if __name__=='__main__':
     if torch.cuda.is_available():
         device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
     else:
+        # MPS (Apple Silicon) segfaults inside Apple's Metal driver during
+        # extraction on this setup, and degrades to a near-stall over a long
+        # run even when the crash is avoided — see EXPERIMENTS.md, issue 1.
+        # CPU is slower but the only backend verified stable end-to-end here.
         device = torch.device("cpu")
 
     print(f"Device       : {device}")
@@ -138,7 +140,7 @@ if __name__=='__main__':
 
         # ── 3. Stack all layers into one tensor, move to CPU ─────────────────
         # Shape: (batch, n_layers, seq_len, hidden_dim)
-        hidden = torch.stack(outputs.hidden_states, dim=1).float()
+        hidden = torch.stack(outputs.hidden_states, dim=1).float().cpu()
         mask   = attention_mask.cpu()
 
         # ── 4. Aggregate each sample and store the compact feature vector ─────
@@ -201,7 +203,7 @@ if __name__=='__main__':
         with torch.no_grad():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
 
-        hidden = torch.stack(outputs.hidden_states, dim=1).float()
+        hidden = torch.stack(outputs.hidden_states, dim=1).float().cpu()
         mask   = attention_mask.cpu()
 
         for i in range(hidden.size(0)):
